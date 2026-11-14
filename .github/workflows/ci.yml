@@ -1,0 +1,396 @@
+# Fast checks on every push and pull request.
+#
+# Deliberately does not build the PyInstaller binaries -- that is five runners
+# and several minutes, and release.yml already does it. What this catches is
+# the cheap-to-catch class: a syntax error, an import that only resolves on the
+# author's machine, a subcommand that no longer parses, a broken live view, a
+# JavaScript typo in the npm launcher. Everything here runs without a Windows
+# server to talk to.
+
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  python:
+    strategy:
+      fail-fast: false
+      matrix:
+        # The oldest and newest interpreters the package claims to support.
+        # Anything in between that breaks would break one of these too.
+        include:
+          - { os: ubuntu-latest, python: "3.9" }
+          - { os: ubuntu-latest, python: "3.13" }
+          - { os: windows-latest, python: "3.13" }
+          - { os: macos-latest, python: "3.13" }
+
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e .
+
+      - name: Every module imports
+        shell: bash
+        run: |
+          python - <<'PY'
+          import importlib
+          for name in ("autordp", "autordp.cli", "autordp.cli.ui",
+                       "autordp.cli.parser", "autordp.cli.context",
+                       "autordp.cli.commands", "autordp.cli.menu",
+                       "autordp.cli.main", "autordp.client", "autordp.codebase",
+                       "autordp.config", "autordp.credentials", "autordp.input",
+                       "autordp.loop", "autordp.session", "autordp.shell",
+                       "autordp.webview", "autordp.daemon",
+                       "autordp.environment"):
+              importlib.import_module(name)
+              print("ok", name)
+          PY
+
+      # Parsing is where a CLI regression shows up first and cheapest: a
+      # renamed dest, a flag moved to the wrong parent, a subcommand that no
+      # longer accepts what the README says it does.
+      - name: Every subcommand parses
+        shell: bash
+        run: |
+          python - <<'PY'
+          from autordp.cli import parser
+
+          for argv in [
+              ["--version"], ["--help"],
+              ["connect", "--help"], ["repo", "--help"], ["config", "--help"],
+              ["doctor", "--help"], ["keys", "--help"], ["list", "--help"],
+              ["connect", "-c", "type hello", "--keep-open", "--view"],
+              ["connect", "--hold", "--conn", "2", "-p", "9000"],
+              ["repo", "https://example.com/x.git", "-m", "0", "--dry-run"],
+              ["repo", "u", "--editor", "code", "-p", "9000"],
+              ["config", "set", "--remember-password", "--name", "prod"],
+              ["config", "forget", "2"],
+              ["config", "show", "--json"],
+              ["doctor", "--no-network", "--json"],
+              ["keys", "ctrl"], ["list", "--json"],
+          ]:
+              try:
+                  parser.parse(argv)
+              except SystemExit as exc:
+                  assert exc.code in (0, None), (argv, exc.code)
+                  print("ok (exits)", argv)
+                  continue
+              print("ok", argv)
+
+          # The suppressed-default mechanism, asserted rather than assumed:
+          # connection flags must work before *and* after the subcommand.
+          assert parser.parse(["--host", "a", "repo", "u"]).host == "a"
+          assert parser.parse(["repo", "u", "--host", "a"]).host == "a"
+          assert parser.parse(["repo", "u"]).host == ""
+          print("shared connection flags survive both orders")
+
+          # Every subcommand must survive its own options. An option whose dest
+          # collides with the subparsers' `command` silently overwrites it, and
+          # the dispatcher then routes on a list instead of a name -- which is
+          # exactly what `connect -c` did before it was given its own dest.
+          for argv, expected in [
+              (["connect", "-c", "type hi"], "connect"),
+              (["repo", "u", "--dry-run"], "repo"),
+              (["config", "show"], "config"),
+              (["doctor"], "doctor"),
+              (["keys"], "keys"),
+              (["list"], "list"),
+          ]:
+              actual = parser.parse(argv).command
+              assert actual == expected, f"{argv} -> {actual!r}, want {expected!r}"
+          assert parser.parse(["connect", "-c", "a", "-c", "b"]).run_commands == ["a", "b"]
+
+          # -p is the LIVE VIEW port. There is no RDP port flag: if -p ever
+          # leaks back into the RDP port, `-p 9000` silently connects to the
+          # wrong place, which parses fine and fails confusingly.
+          assert parser.parse(["connect"]).port is None
+          assert parser.parse(["connect"]).view is False
+          assert parser.parse(["connect", "--view"]).view is True
+          assert parser.parse(["connect", "-p", "9000"]).port == 9000
+          for bad in (["connect", "--rdp-port", "3390"], ["connect", "--view", "9000"]):
+              try:
+                  parser.parse(bad)
+              except SystemExit as exc:
+                  assert exc.code not in (0, None), bad
+              else:
+                  raise AssertionError(f"{bad} should not parse")
+          assert parser.parse(["connect", "--conn", "3"]).conn == 3
+          assert parser.parse(["config", "forget", "2"]).index == 2
+          assert parser.parse(["connect", "--hold"]).hold is True
+          print("every subcommand routes on its own name")
+          PY
+
+      # The live-view port must never become the RDP port. This is the one
+      # regression in the flag rework that would be silent rather than loud.
+      - name: The live-view port stays out of the RDP port
+        shell: bash
+        run: |
+          python - <<'PY'
+          import os
+          os.environ.pop("RDP_PORT", None)
+          os.environ["RDP_PROFILE"] = "no-such-profile.json"
+          from autordp.cli import context, parser
+          args = parser.parse(["connect", "-p", "9000", "--host", "h",
+                               "--user", "u", "--password", "x", "--no-input"])
+          settings = context.resolve(args, prompt_missing=False)
+          assert settings.port == 3389, f"live-view port leaked into RDP: {settings.port}"
+          print("-p 9000 sets the live view; RDP stays on 3389")
+          PY
+
+      # Both of these shipped broken in 0.2.0 and are invisible from a
+      # checkout, because they only bite a PyInstaller one-file build.
+      - name: Detaching does not break a frozen build
+        shell: bash
+        run: |
+          python - <<'PY'
+          import os, sys
+          from autordp import daemon, environment
+
+          # What a one-file child would inherit from its parent. Leaving these
+          # in makes the child's bootloader skip extraction and run out of the
+          # parent's /tmp/_MEIxxxx -- which the parent deletes on exit, so the
+          # child dies on its next lazy import with
+          #   FileNotFoundError: /tmp/_MEIxxxx/base_library.zip
+          os.environ.update({
+              "_MEIPASS2": "/tmp/_MEIabc",
+              "_PYI_ARCHIVE_FILE": "/usr/bin/autordp",
+              "_PYI_APPLICATION_HOME_DIR": "/tmp/_MEIabc",
+              "LD_LIBRARY_PATH": "/tmp/_MEIabc",
+              "LD_LIBRARY_PATH_ORIG": "/usr/local/lib",
+              "RDP_PASSWORD": "keep-me",
+          })
+          sys.frozen = True
+          try:
+              child = daemon.child_environment()
+          finally:
+              del sys.frozen
+
+          for name in environment._BOOTLOADER_VARS:
+              assert name not in child, f"{name} leaked into the child"
+          assert child["LD_LIBRARY_PATH"] == "/usr/local/lib", child["LD_LIBRARY_PATH"]
+          assert "LD_LIBRARY_PATH_ORIG" not in child
+          assert child["RDP_PASSWORD"] == "keep-me", "real environment was dropped"
+          assert child[daemon.MARKER] == "1"
+          print("frozen child gets its own extraction, keeps the real environment")
+          PY
+
+      # The bug this guards: git inherits LD_LIBRARY_PATH from a frozen build,
+      # git-remote-https loads the *bundled* libcrypto instead of the one it
+      # was built against, and dies on a symbol lookup. git reports only
+      #   fatal: remote helper 'https' aborted session
+      # which says nothing about why. It needs a distro whose OpenSSL differs
+      # from the build image's to reproduce for real, so assert the
+      # environment git is handed rather than the clone itself.
+      - name: Cloning does not hand git the bundled libraries
+        shell: bash
+        run: |
+          python - <<'PY'
+          import os, subprocess, sys, tempfile
+          from pathlib import Path
+          from unittest.mock import patch
+          from autordp import codebase
+
+          os.environ.update({"LD_LIBRARY_PATH": "/tmp/_MEIabc",
+                             "LD_LIBRARY_PATH_ORIG": "/usr/local/lib",
+                             "_MEIPASS2": "/tmp/_MEIabc"})
+          seen = {}
+
+          def fake_run(argv, **keywords):
+              seen.update(keywords, argv=argv)
+              return subprocess.CompletedProcess(argv, 0, "", "")
+
+          sys.frozen = True
+          try:
+              with patch("autordp.codebase.subprocess.run", fake_run):
+                  codebase.clone("https://github.com/o/r",
+                                 into=Path(tempfile.mkdtemp()))
+          finally:
+              del sys.frozen
+
+          handed = seen["env"]
+          assert handed["LD_LIBRARY_PATH"] == "/usr/local/lib", handed["LD_LIBRARY_PATH"]
+          assert "LD_LIBRARY_PATH_ORIG" not in handed
+          assert "_MEIPASS2" not in handed
+          assert handed["GIT_TERMINAL_PROMPT"] == "0", "a detached run has no terminal to prompt on"
+          assert handed.get("PATH"), "git needs the real PATH"
+          print("git is handed the system libraries, not the bundled ones")
+          PY
+
+      - name: The pid file never holds a password
+        shell: bash
+        run: |
+          python - <<'PY'
+          import json, pathlib, tempfile
+          from autordp import daemon
+
+          for argv in (["repo", "u", "--password", "hunter2"],
+                       ["repo", "u", "--password=hunter2"]):
+              assert "hunter2" not in " ".join(daemon.redact(argv)), argv
+
+          path = pathlib.Path(tempfile.mkdtemp()) / "autordp.pid"
+          daemon.write_record(path, 123, ["repo", "u", "--password", "hunter2"],
+                              pathlib.Path("x.log"), view=8900)
+          raw = path.read_text(encoding="utf-8")
+          assert "hunter2" not in raw, "secret written to disk: " + raw
+          assert json.loads(raw)["pid"] == 123
+          print("pid file redacts secrets")
+          PY
+
+      # Several saved connections, addressed by index.
+      - name: Saved connections round-trip
+        shell: bash
+        run: |
+          python - <<'PY'
+          import os, tempfile
+          os.environ["RDP_PROFILE"] = os.path.join(tempfile.mkdtemp(), "p.json")
+          from autordp import credentials as c
+          assert c.count() == 0
+          c.save({"name": "prod", "host": "10.0.0.5", "username": "admin"})
+          c.save({"name": "lab", "host": "10.0.0.6", "username": "dev"})
+          c.save({"name": "prod2", "host": "10.0.0.5", "username": "admin"})
+          assert c.count() == 2, "same host+user should update, not duplicate"
+          assert c.load(1)["name"] == "prod2"
+          assert c.load(2)["host"] == "10.0.0.6"
+          assert c.load(99) == {}, "out-of-range index must be empty, not raise"
+          assert c.forget(1) and c.count() == 1
+          assert not c.forget(9)
+          print("multi-connection store: add, update, index, forget")
+          PY
+
+      # The live view is plain HTTP over a PIL image, so it can be exercised
+      # end to end against a stand-in client with no RDP server anywhere.
+      - name: Live view serves frames
+        shell: bash
+        run: |
+          python - <<'PY'
+          import io, json, time, urllib.request
+          from PIL import Image
+          from autordp.webview import LiveView, free_port
+
+          class Stop: tripped = False
+          class Config: target, width, height = "t@h:3389", 64, 48
+          class Client:
+              is_alive, stop, settings = True, Stop(), Config()
+              n = 0
+              def current_frame(self):
+                  # A *different* image each call, like a real desktop. A
+                  # constant one would exercise the opposite path: the stream
+                  # deliberately withholds an unchanged frame for up to
+                  # IDLE_KEEPALIVE seconds, which is what keeps an idle session
+                  # near zero bandwidth -- and would stall this test instead.
+                  self.n += 1
+                  return Image.new("RGB", (64, 48), (self.n % 256, 20, 30))
+
+          view = LiveView(Client(), port=free_port(8907), max_fps=30)
+          url = view.start()
+          try:
+              time.sleep(0.3)
+              page = urllib.request.urlopen(url, timeout=5).read()
+              assert b"/stream" in page and b"cannot send input" in page
+
+              info = json.loads(urllib.request.urlopen(url + "status.json", timeout=5).read())
+              assert info["connected"] and info["width"] == 64, info
+
+              frame = urllib.request.urlopen(url + "frame.jpg", timeout=5)
+              assert frame.headers["Content-Type"] == "image/jpeg"
+              assert Image.open(io.BytesIO(frame.read())).size == (64, 48)
+
+              stream = urllib.request.urlopen(url + "stream", timeout=10)
+              assert "multipart/x-mixed-replace" in stream.headers["Content-Type"]
+              chunk, deadline = b"", time.time() + 15
+              while chunk.count(b"--autordpframe") < 2 and time.time() < deadline:
+                  # read1, not read: read(n) blocks until it has all n bytes or
+                  # hits EOF, and an MJPEG response never ends. read1 returns
+                  # whatever has arrived.
+                  data = stream.read1(4096)
+                  if not data:
+                      break
+                  chunk += data
+              stream.close()
+              assert chunk.count(b"--autordpframe") >= 2, chunk[:200]
+              print("live view: page, status, frame and stream all served")
+          finally:
+              view.stop()
+          PY
+
+      - name: Commands that need no server
+        shell: bash
+        run: |
+          autordp --version
+          autordp keys ctrl
+          autordp config path
+          autordp config env --json > /dev/null
+          # doctor exits 1 when something is broken, and on a runner with no
+          # saved profile the port probe has nothing to aim at -- so only the
+          # JSON shape is asserted here, not the exit code.
+          autordp doctor --json --no-network --no-input > doctor.json || true
+          python -c "import json; d=json.load(open('doctor.json')); assert 'checks' in d; print(len(d['checks']), 'checks')"
+
+  node:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Syntax
+        run: |
+          node --check npm/autordp/bin/autordp.js
+          node --check npm/autordp/install.js
+          node --check scripts/build-npm.mjs
+
+      # A stub binary is enough to prove the whole assembly path: the launcher
+      # finds it, the manifests are well formed, and the modes survive.
+      - name: Assemble against a stub binary
+        run: |
+          set -euo pipefail
+          for key in win32-x64 linux-x64 linux-arm64 darwin-arm64; do
+            mkdir -p "dist/artifacts/autordp-$key"
+            name=autordp
+            if [[ "$key" == win32-* ]]; then name=autordp.exe; fi
+            printf '#!/bin/sh\necho stub\n' > "dist/artifacts/autordp-$key/$name"
+          done
+          node scripts/build-npm.mjs --artifacts dist/artifacts --out dist/npm
+
+          version=$(grep -oP '__version__\s*=\s*"\K[^"]+' src/autordp/__init__.py)
+          node -e "
+            const fs = require('fs');
+            const launcher = JSON.parse(fs.readFileSync('dist/npm/autordp/package.json'));
+            const expected = '$version';
+            if (launcher.version !== expected) throw new Error('launcher version ' + launcher.version);
+            if (!launcher.bin.autordp) throw new Error('launcher declares no autordp bin');
+            const optional = Object.entries(launcher.optionalDependencies);
+            if (optional.length !== 4) throw new Error('expected 4 platform deps, got ' + optional.length);
+            for (const [name, v] of optional) {
+              if (v !== expected) throw new Error(name + ' pinned to ' + v);
+              const dir = 'dist/npm/' + name.split('/')[1];
+              const manifest = JSON.parse(fs.readFileSync(dir + '/package.json'));
+              if (!manifest.os || !manifest.cpu) throw new Error(name + ' has no os/cpu');
+            }
+            console.log('launcher and', optional.length, 'platform packages at', expected);
+          "
+
+      - name: Launcher reports a missing binary clearly
+        run: |
+          set -euo pipefail
+          # Run it with nothing installed: it must fail with guidance, not a
+          # module-not-found stack trace.
+          output=$(node dist/npm/autordp/bin/autordp.js --version 2>&1 || true)
+          echo "$output"
+          echo "$output" | grep -q "not installed"
